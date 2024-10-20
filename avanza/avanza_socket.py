@@ -10,7 +10,6 @@ WEBSOCKET_URL = "wss://www.avanza.se/_push/cometd"
 
 logger = logging.getLogger("avanza_socket")
 
-
 class AvanzaSocket:
     def __init__(self, push_subscription_id, cookies):
         self._socket = None
@@ -29,18 +28,12 @@ class AvanzaSocket:
         timeout_count = 40
         timeout_value = 0.250
 
-        # Waits for a maximum of 10 seconds for the connection to be complete
         for _ in range(0, timeout_count):
             if self._connected:
                 return
             await asyncio.sleep(timeout_value)
 
-        raise TimeoutError(
-            "\
-            We weren't able to connect \
-            to the websocket within the expected timeframe \
-        "
-        )
+        raise TimeoutError("We weren't able to connect to the websocket within the expected timeframe")
 
     async def __create_socket(self):
         async with websockets.connect(
@@ -76,7 +69,7 @@ class AvanzaSocket:
         )
 
     async def __socket_subscribe(
-        self, subscription_string, callback: Callable[[str, dict], Any]
+        self, subscription_string, callback: Callable[[dict], Any]
     ):
         self._subscriptions[subscription_string] = {"callback": callback}
 
@@ -100,19 +93,24 @@ class AvanzaSocket:
     async def __handshake(self, message: dict):
         if message.get("successful", False):
             self._client_id = message.get("clientId")
-            await self.__send(
-                {
-                    "advice": {"timeout": 0},
-                    "channel": "/meta/connect",
-                    "clientId": self._client_id,
-                    "connectionType": "websocket",
-                }
-            )
+            logger.info(f"Handshake successful. New clientId: {self._client_id}")
+            await self.__send({
+                "advice": {"timeout": 0},
+                "channel": "/meta/connect",
+                "clientId": self._client_id,
+                "connectionType": "websocket",
+            })
             return
 
+        logger.error(f"Handshake unsuccessful: {message}")
         advice = message.get("advice")
         if advice and advice.get("reconnect") == "handshake":
+            logger.info("Server advises to re-handshake.")
             await self.__send_handshake_message()
+        else:
+            # If handshake fails and no advice is given, we need to handle it
+            logger.error("Handshake failed without advice. Need to re-authenticate.")
+            await self._on_handshake_failure()
 
     async def __connect(self, message: dict):
         successful = message.get("successful", False)
@@ -136,14 +134,13 @@ class AvanzaSocket:
             if not self._connected:
                 self._connected = True
                 await self.__resubscribe_existing_subscriptions()
-
-        elif self._client_id:
-            await self.__send_connect_message()
-
-    async def __resubscribe_existing_subscriptions(self):
-        for key, value in self._subscriptions.items():
-            if value.get("client_id") != self._client_id:
-                await self.__socket_subscribe(key, value["callback"])
+        else:
+            # Handle unsuccessful connect
+            logger.error(f"Connect unsuccessful: {message}")
+            # Attempt re-handshake if client is unknown
+            if message.get("error") == "402::Unknown client":
+                logger.info("Client is unknown during connect. Re-handshaking...")
+                await self.__handle_unknown_client()
 
     async def __disconnect(self, message):
         await self.__send_handshake_message()
@@ -154,6 +151,14 @@ class AvanzaSocket:
             raise ValueError("No subscription channel found on subscription message")
 
         self._subscriptions[subscription]["client_id"] = self._client_id
+
+    async def __handle_unknown_client(self):
+        # Reset client ID and connected status
+        self._client_id = None
+        self._connected = False
+
+        # Perform a new handshake
+        await self.__send_handshake_message()
 
     async def __socket_message_handler(self):
         message_action = {
@@ -171,21 +176,34 @@ class AvanzaSocket:
             logger.info(f"Incoming message: {message}")
 
             if error:
-                logger.error(error)
+                logger.error(f"Error received on channel {message_channel}: {error}")
+                if "402::Unknown client" in error:
+                    logger.info("Client is unknown. Re-handshaking...")
+                    await self.__handle_unknown_client()
+                    continue  # Skip processing this message further
+                # Handle other errors as needed
 
             action = message_action.get(message_channel)
-            # Use user subscribed action
             if action is None:
-                callback = self._subscriptions[message_channel]["callback"]
-                if asyncio.iscoroutinefunction(callback):
-                    await callback(message)
+                # Handle subscribed data
+                callback = self._subscriptions.get(message_channel, {}).get("callback")
+                if callback:
+                    if asyncio.iscoroutinefunction(callback):
+                        await callback(message)
+                    else:
+                        callback(message)
                 else:
-                    callback(message)
+                    logger.warning(f"No callback found for channel {message_channel}")
             else:
                 await action(message)
 
+    async def __resubscribe_existing_subscriptions(self):
+        for subscription_string, subscription_info in self._subscriptions.items():
+            await self.__socket_subscribe(subscription_string, subscription_info["callback"])
+
+
     async def subscribe_to_id(
-        self, channel: ChannelType, id: str, callback: Callable[[str, dict], Any]
+        self, channel: ChannelType, id: str, callback: Callable[[dict], Any]
     ):
         return await self.subscribe_to_ids(channel, [id], callback)
 
@@ -193,7 +211,7 @@ class AvanzaSocket:
         self,
         channel: ChannelType,
         ids: Sequence[str],
-        callback: Callable[[str, dict], Any],
+        callback: Callable[[dict], Any],
     ):
         valid_channels_for_multiple_ids = [
             ChannelType.ORDERS,
@@ -203,8 +221,14 @@ class AvanzaSocket:
 
         if len(ids) > 1 and channel not in valid_channels_for_multiple_ids:
             raise ValueError(
-                f"Multiple ids is not supported for channels other than {valid_channels_for_multiple_ids}"
+                f"Multiple ids are not supported for channels other than {valid_channels_for_multiple_ids}"
             )
 
         subscription_string = f'/{channel.value}/{",".join(ids)}'
         await self.__socket_subscribe(subscription_string, callback)
+
+    async def _on_handshake_failure(self):
+        # Close the existing socket
+        await self._socket.close()
+        # Trigger re-authentication
+        await self._on_session_expired()
